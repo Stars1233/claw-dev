@@ -335,6 +335,17 @@ async function resolveModelSelection({ rl, env, provider, modelArg, envKey, defa
     await rl.question(`Model for ${provider} [${existing}] (any model id is allowed): `)
   ).trim();
 
+  // Warn if the input looks like a menu number instead of a model name
+  if (answer && /^\d+$/.test(answer)) {
+    process.stdout.write(
+      `\n⚠  "${answer}" looks like a menu number, not a model name.\n` +
+      `   Did you mean one of: ${suggestions.join(", ")}?\n` +
+      `   Using default model: ${existing}\n\n`
+    );
+    env[envKey] = existing;
+    return env[envKey];
+  }
+
   env[envKey] = answer || existing;
   return env[envKey];
 }
