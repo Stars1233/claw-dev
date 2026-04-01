@@ -3,6 +3,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 import { FunctionCallingConfigMode, GoogleGenAI, createPartFromFunctionResponse } from "@google/genai";
 import { config as loadEnv } from "dotenv";
+import { formatOpenAIAuthHint, resolveOpenAIAuth } from "../shared/openaiAuth.js";
+import {
+  openAICompatibleMessagesToResponsesInput,
+  openAICompatibleToolsToResponsesTools,
+  parseResponsesSseToAnthropicContent,
+} from "../shared/openaiResponsesCompat.js";
+import { providerLabel, providerModelCatalog } from "../shared/providerModels.js";
 
 loadEnv({ quiet: true });
 
@@ -69,7 +76,6 @@ const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY?.trim();
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE?.trim();
 const OLLAMA_NUM_CTX = parseOptionalInt(process.env.OLLAMA_NUM_CTX);
 const OLLAMA_NUM_PREDICT = parseOptionalInt(process.env.OLLAMA_NUM_PREDICT);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
 const COPILOT_TOKEN =
@@ -79,6 +85,7 @@ const COPILOT_TOKEN =
   process.env.GH_TOKEN?.trim();
 const ZAI_API_KEY = process.env.ZAI_API_KEY?.trim();
 const geminiClient = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+const OPENAI_AUTH = PROVIDER === "openai" ? resolveOpenAIAuth({ env: process.env }) : null;
 
 assertProviderConfiguration();
 
@@ -210,8 +217,16 @@ function resolveModel(provider: CompatProvider): string {
 }
 
 function assertProviderConfiguration(): void {
-  if (PROVIDER === "openai" && !OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is required when ANTHROPIC_COMPAT_PROVIDER=openai");
+  if (PROVIDER === "openai") {
+    const auth = OPENAI_AUTH ?? {
+      status: "missing" as const,
+      authType: "none" as const,
+      authPath: "~/.codex/auth.json",
+      reason: "auth-not-initialized",
+    };
+    if (auth.status !== "ok") {
+      throw new Error(formatOpenAIAuthHint(auth));
+    }
   }
 
   if (PROVIDER === "gemini" && !GEMINI_API_KEY) {
@@ -281,48 +296,6 @@ function buildModelInfo(id: string) {
   };
 }
 
-function providerModelCatalog(provider: CompatProvider): string[] {
-  const customCatalog = providerCustomCatalog(provider);
-
-  switch (provider) {
-    case "openai":
-      return uniqueStrings([ACTIVE_MODEL, ...customCatalog, "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]);
-    case "gemini":
-      return uniqueStrings([ACTIVE_MODEL, ...customCatalog, "gemini-2.5-flash", "gemini-2.5-pro", "gemma-3-27b-it"]);
-    case "groq":
-      return uniqueStrings([
-        ACTIVE_MODEL,
-        ...customCatalog,
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3-32b",
-      ]);
-    case "copilot":
-      return uniqueStrings([
-        ACTIVE_MODEL,
-        process.env.COPILOT_MODEL_SONNET?.trim() || "",
-        process.env.COPILOT_MODEL_OPUS?.trim() || "",
-        process.env.COPILOT_MODEL_HAIKU?.trim() || "",
-        ...customCatalog,
-        "openai/gpt-4.1-mini",
-        "openai/gpt-4.1",
-        "openai/gpt-4o",
-        "openai/o4-mini",
-      ]);
-    case "zai":
-      return uniqueStrings([ACTIVE_MODEL, ...customCatalog, "glm-5", "glm-4.5", "glm-4.5-air"]);
-    case "ollama":
-      return uniqueStrings([
-        process.env.OLLAMA_MODEL?.trim() || "qwen3",
-        ...customCatalog,
-        "qwen3",
-        "qwen2.5-coder:7b",
-        "qwen2.5-coder:14b",
-        "deepseek-r1:8b",
-      ]);
-  }
-}
-
 function resolveRequestModel(body: AnthropicMessageRequest): string {
   const requested = body.model?.trim();
   if (!requested) {
@@ -374,35 +347,6 @@ function resolveCopilotRequestedModel(requested: string): string {
   return requested;
 }
 
-function providerLabel(provider: CompatProvider): string {
-  switch (provider) {
-    case "openai":
-      return "OpenAI";
-    case "gemini":
-      return "Google Gemini";
-    case "groq":
-      return "Groq";
-    case "ollama":
-      return "Ollama";
-    case "copilot":
-      return "GitHub Copilot";
-    case "zai":
-      return "Z.AI";
-  }
-}
-
-function providerCustomCatalog(provider: CompatProvider): string[] {
-  const envKey = `${provider.toUpperCase()}_MODELS`;
-  return (process.env[envKey] ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim().length > 0))];
-}
-
 async function handleMessages(body: AnthropicMessageRequest) {
   const requestId = `req_${randomUUID()}`;
   const providerModel = resolveRequestModel(body);
@@ -451,6 +395,19 @@ async function handleMessages(body: AnthropicMessageRequest) {
 }
 
 async function runOpenAI(body: AnthropicMessageRequest, model: string): Promise<AnthropicContentBlock[]> {
+  if (!OPENAI_AUTH || OPENAI_AUTH.status !== "ok") {
+    throw new Error(
+      formatOpenAIAuthHint(
+        OPENAI_AUTH ?? {
+          status: "missing",
+          authType: "none",
+          authPath: "~/.codex/auth.json",
+          reason: "auth-not-initialized",
+        },
+      ),
+    );
+  }
+
   const toolNameById = new Map<string, string>();
   const systemInstruction = normalizeSystemPrompt(body.system);
   const rawMessages = anthropicMessagesToOpenAICompatible(
@@ -462,11 +419,53 @@ async function runOpenAI(body: AnthropicMessageRequest, model: string): Promise<
   const rawTools = anthropicToolsToOpenAITools(body.tools ?? []);
   const { messages, tools } = compactOpenAICompatibleRequest(systemInstruction, rawMessages, rawTools, "openai");
 
+  if (OPENAI_AUTH.authType === "oauth") {
+    const instructions = systemInstruction || "You are a helpful assistant.";
+    const rawInput = openAICompatibleMessagesToResponsesInput(messages);
+    const responseTools = openAICompatibleToolsToResponsesTools(tools);
+    const compactRequest = compactOpenAIResponsesRequest(instructions, rawInput, responseTools);
+    const response = await fetch("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${OPENAI_AUTH.bearerToken}`,
+        ...(OPENAI_AUTH.accountId ? { "ChatGPT-Account-Id": OPENAI_AUTH.accountId } : {}),
+        "User-Agent": "codex-cli/0.117.0",
+        originator: "codex_cli_rs",
+        "x-client-request-id": randomUUID(),
+      },
+      body: JSON.stringify({
+        model,
+        instructions: compactRequest.instructions,
+        input: compactRequest.input,
+        tools: compactRequest.tools,
+        tool_choice: buildResponsesToolChoice(body.tool_choice, compactRequest.tools),
+        parallel_tool_calls: true,
+        reasoning: { effort: "none" },
+        store: false,
+        stream: true,
+        include: [],
+        text: {
+          format: { type: "text" },
+          verbosity: "medium",
+        },
+      }),
+    });
+
+    const sseText = await response.text();
+    if (!response.ok) {
+      throw new Error(sseText);
+    }
+
+    return parseResponsesSseToAnthropicContent(sseText) as AnthropicContentBlock[];
+  }
+
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_AUTH.bearerToken}`,
     },
     body: JSON.stringify({
       model,
@@ -891,6 +890,34 @@ function compactOpenAICompatibleRequest(
   };
 }
 
+function compactOpenAIResponsesRequest(
+  instructions: string,
+  input: Array<Record<string, unknown>>,
+  tools: Array<Record<string, unknown>>,
+) {
+  const budget = 12000;
+  let compactInput = [...input];
+  let compactTools = [...tools];
+
+  while (estimateOpenAIResponsesPayload(instructions, compactInput, compactTools) > budget && compactInput.length > 4) {
+    compactInput = compactInput.slice(1);
+  }
+
+  if (estimateOpenAIResponsesPayload(instructions, compactInput, compactTools) > budget && compactTools.length > 12) {
+    compactTools = compactTools.slice(0, 12);
+  }
+
+  if (estimateOpenAIResponsesPayload(instructions, compactInput, compactTools) > budget && compactTools.length > 6) {
+    compactTools = compactTools.slice(0, 6);
+  }
+
+  return {
+    instructions,
+    input: compactInput,
+    tools: compactTools,
+  };
+}
+
 function trimOpenAICompatibleMessages(
   messages: Array<Record<string, unknown>>,
   provider: "openai" | "groq" | "copilot" | "zai",
@@ -962,6 +989,20 @@ function estimateOpenAICompatiblePayload(
   );
 }
 
+function estimateOpenAIResponsesPayload(
+  instructions: string,
+  input: Array<Record<string, unknown>>,
+  tools: Array<Record<string, unknown>>,
+): number {
+  return Math.ceil(
+    JSON.stringify({
+      instructions,
+      input,
+      tools,
+    }).length / 4,
+  );
+}
+
 function buildGeminiFunctionCallingConfig(
   toolChoice: AnthropicMessageRequest["tool_choice"],
   toolNames: string[],
@@ -999,6 +1040,25 @@ function buildOpenAIToolChoice(toolChoice: AnthropicMessageRequest["tool_choice"
       },
     };
   }
+  return "required";
+}
+
+function buildResponsesToolChoice(
+  toolChoice: AnthropicMessageRequest["tool_choice"],
+  tools: Array<Record<string, unknown>>,
+) {
+  if (!toolChoice || toolChoice.type === "auto") {
+    return "auto";
+  }
+
+  if (toolChoice.type === "none" || tools.length === 0) {
+    return "none";
+  }
+
+  if (toolChoice.type === "tool" && toolChoice.name) {
+    return "required";
+  }
+
   return "required";
 }
 

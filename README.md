@@ -31,7 +31,7 @@ Use the bundled client with the normal Anthropic login flow or with `ANTHROPIC_A
 
 ### OpenAI
 
-Use an OpenAI API key and route requests through the local compatibility proxy.
+Route requests through the local compatibility proxy. By default Claw Dev uses `OPENAI_API_KEY`. As an experimental fallback, it can also reuse an existing ChatGPT/Codex login from `~/.codex/auth.json` when available.
 
 ### Gemini
 
@@ -68,7 +68,8 @@ Provider-specific requirements:
 - Anthropic
   - an Anthropic account for in-app login, or `ANTHROPIC_API_KEY`
 - OpenAI
-  - `OPENAI_API_KEY`
+  - `codex login` if you want to reuse your ChatGPT/Codex OAuth session from `~/.codex/auth.json`
+  - or `OPENAI_API_KEY` as a fallback
 - Gemini
   - `GEMINI_API_KEY`
 - Groq
@@ -187,7 +188,7 @@ After you choose a provider, Claw Dev also lets you enter any model id you want 
 - `openai/o4-mini`
 - `qwen2.5-coder:14b`
 
-This makes model selection flexible even when the bundled in-app `/model` picker still shows provider-specific legacy labels.
+Claw Dev also seeds the bundled in-app `/model` picker with provider-specific suggestions for the current session, while still allowing any custom model id through `--model`.
 
 ## Additional Cloud Provider Setup
 
@@ -218,8 +219,10 @@ Recommended `.env` values:
 
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
-OPENAI_MODEL=gpt-4.1-mini
+OPENAI_MODEL=gpt-5.4
 ```
+
+If `~/.codex/auth.json` exists, Claw Dev can reuse that ChatGPT/Codex login as an experimental fallback. Example placeholder values such as `your_openai_api_key_here` are ignored. Keyring-backed Codex auth is not supported yet.
 
 ## How To Use Ollama With Claw Dev
 
@@ -355,8 +358,10 @@ ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
-OPENAI_MODEL=gpt-4.1-mini
+OPENAI_MODEL=gpt-5.4
 ```
+
+If you already ran `codex login`, you can leave `OPENAI_API_KEY` unset and Claw Dev will reuse `~/.codex/auth.json` as an experimental fallback. Example placeholder values are treated as unset.
 
 ### Gemini
 

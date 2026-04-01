@@ -14,6 +14,10 @@ const original = source;
 const replacements = [
   ["Welcome to Claude Code", "Welcome to Claw Dev"],
   ["Claude Code", "Claw Dev"],
+  [
+    "Switch between Claude models. Applies to this session and future Claude Code sessions. For other/previous model names, specify with --model.",
+    "Switch between available models. Applies to this session and future Claw Dev sessions. For other or custom model names, specify with --model.",
+  ],
 
   // Clawd mini mascot in the startup panel.
   ["▛███▜", "CLAWD"],

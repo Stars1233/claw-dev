@@ -1,9 +1,11 @@
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline/promises");
+const { pathToFileURL } = require("node:url");
 
 const repoRoot = __dirname;
 const workspaceRoot = path.dirname(repoRoot);
@@ -24,6 +26,7 @@ const defaultPorts = {
 let exiting = false;
 let proxyProcess = null;
 let ownsProxyProcess = false;
+let restoreModelPickerCache = null;
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
@@ -61,6 +64,7 @@ async function main() {
     env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${env.ANTHROPIC_COMPAT_PORT}`;
     env.ANTHROPIC_AUTH_TOKEN = "claw-dev-proxy";
     delete env.ANTHROPIC_API_KEY;
+    await primeBundledModelPicker(provider, env);
     return launchBundledClient(env, forwardArgs);
   } finally {
     rl.close();
@@ -201,10 +205,21 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
 
   switch (provider) {
     case "openai": {
-      if (!env.OPENAI_API_KEY?.trim()) {
-        const key = (await rl.question("Enter OPENAI_API_KEY (input is visible): ")).trim();
+      const auth = await resolveOpenAIAuthForLauncher(env);
+      if (auth.status === "ok" && auth.authType === "oauth") {
+        env.OPENAI_AUTH_TOKEN = auth.bearerToken;
+        delete env.OPENAI_API_KEY;
+        process.stdout.write(`\nReusing OpenAI ChatGPT login from ${auth.authPath}.\n`);
+      } else if (auth.status !== "ok") {
+        process.stdout.write(`\n${auth.hint}\n`);
+      } else {
+        process.stdout.write("\nUsing OPENAI_API_KEY from the current environment.\n");
+      }
+
+      if (!env.OPENAI_AUTH_TOKEN?.trim() && !env.OPENAI_API_KEY?.trim()) {
+        const key = (await rl.question("Enter OPENAI_API_KEY (input is visible, fallback mode): ")).trim();
         if (!key) {
-          throw new Error("OPENAI_API_KEY is required for OpenAI mode.");
+          throw new Error("OpenAI mode requires either a reusable Codex login or OPENAI_API_KEY.");
         }
         env.OPENAI_API_KEY = key;
       }
@@ -215,8 +230,8 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "OPENAI_MODEL",
         defaultModel: "gpt-4.1-mini",
-        suggestions: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o4-mini"],
       });
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching OpenAI mode with model ${env.OPENAI_MODEL}.\n`);
       break;
     }
@@ -235,8 +250,8 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "GEMINI_MODEL",
         defaultModel: "gemini-2.5-flash",
-        suggestions: ["gemini-2.5-flash", "gemini-2.5-pro", "gemma-3-27b-it"],
       });
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching Gemini mode with model ${env.GEMINI_MODEL}.\n`);
       break;
     }
@@ -255,8 +270,8 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "GROQ_MODEL",
         defaultModel: "openai/gpt-oss-20b",
-        suggestions: ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3-32b", "llama-3.3-70b-versatile"],
       });
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching Groq mode with model ${env.GROQ_MODEL}.\n`);
       break;
     }
@@ -269,9 +284,9 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "OLLAMA_MODEL",
         defaultModel: "qwen3",
-        suggestions: ["qwen3", "qwen2.5-coder:7b", "qwen2.5-coder:14b", "deepseek-r1:8b"],
       });
       env.OLLAMA_KEEP_ALIVE = env.OLLAMA_KEEP_ALIVE?.trim() || "30m";
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching Ollama mode against ${env.OLLAMA_BASE_URL} with model ${env.OLLAMA_MODEL}.\n`);
       process.stdout.write(`Ollama keep-alive is set to ${env.OLLAMA_KEEP_ALIVE} for faster follow-up turns.\n`);
       process.stdout.write("Make sure Ollama is running and the model is already pulled.\n");
@@ -292,8 +307,8 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "COPILOT_MODEL",
         defaultModel: "openai/gpt-4.1-mini",
-        suggestions: ["openai/gpt-4.1-mini", "openai/gpt-4.1", "openai/gpt-4o", "openai/o4-mini"],
       });
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching Copilot mode with model ${env.COPILOT_MODEL}.\n`);
       break;
     }
@@ -312,14 +327,30 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         modelArg,
         envKey: "ZAI_MODEL",
         defaultModel: "glm-5",
-        suggestions: ["glm-5", "glm-4.5", "glm-4.5-air"],
       });
+      await applyCompatModelEnvForLauncher(provider, env);
       process.stdout.write(`\nLaunching z.ai mode with model ${env.ZAI_MODEL}.\n`);
       break;
     }
     default:
       throw new Error(`Unsupported provider: ${provider}`);
   }
+}
+
+async function resolveOpenAIAuthForLauncher(env) {
+  const helperUrl = pathToFileURL(path.join(workspaceRoot, "shared", "openaiAuth.js")).href;
+  const { formatOpenAIAuthHint, resolveOpenAIAuth } = await import(helperUrl);
+  const result = resolveOpenAIAuth({ env });
+  return {
+    ...result,
+    hint: formatOpenAIAuthHint(result),
+  };
+}
+
+async function applyCompatModelEnvForLauncher(provider, env) {
+  const helperUrl = pathToFileURL(path.join(workspaceRoot, "shared", "compatEnv.js")).href;
+  const { applyCompatModelEnv } = await import(helperUrl);
+  applyCompatModelEnv(provider, env);
 }
 
 async function resolveModelSelection({ rl, env, provider, modelArg, envKey, defaultModel, suggestions }) {
@@ -330,13 +361,73 @@ async function resolveModelSelection({ rl, env, provider, modelArg, envKey, defa
     return override;
   }
 
-  process.stdout.write(`Suggested ${provider} models: ${suggestions.join(", ")}\n`);
+  const suggestedModels = suggestions?.length ? suggestions : await getProviderPromptSuggestions(provider, env);
+  process.stdout.write(`Suggested ${provider} models: ${suggestedModels.join(", ")}\n`);
   const answer = (
     await rl.question(`Model for ${provider} [${existing}] (any model id is allowed): `)
   ).trim();
 
   env[envKey] = answer || existing;
   return env[envKey];
+}
+
+async function primeBundledModelPicker(provider, env) {
+  const configPath = process.env.CLAW_GLOBAL_CONFIG_PATH?.trim() || path.join(os.homedir(), ".claude.json");
+
+  let currentConfig = {};
+  try {
+    if (fs.existsSync(configPath)) {
+      currentConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    }
+  } catch (error) {
+    console.warn(`Could not read ${configPath}; skipping model picker cache priming.`);
+    return;
+  }
+
+  const nextOptions = await getProviderModelOptions(provider, env);
+  const previousOptions = Array.isArray(currentConfig.additionalModelOptionsCache)
+    ? currentConfig.additionalModelOptionsCache
+    : undefined;
+
+  if (JSON.stringify(previousOptions ?? []) === JSON.stringify(nextOptions)) {
+    restoreModelPickerCache = null;
+    return;
+  }
+
+  const nextConfig = {
+    ...currentConfig,
+    additionalModelOptionsCache: nextOptions,
+  };
+  fs.writeFileSync(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+
+  restoreModelPickerCache = () => {
+    try {
+      const latest = fs.existsSync(configPath)
+        ? JSON.parse(fs.readFileSync(configPath, "utf8"))
+        : {};
+      const restored = { ...latest };
+      if (previousOptions === undefined) {
+        delete restored.additionalModelOptionsCache;
+      } else {
+        restored.additionalModelOptionsCache = previousOptions;
+      }
+      fs.writeFileSync(configPath, `${JSON.stringify(restored, null, 2)}\n`, "utf8");
+    } catch (error) {
+      console.warn(`Could not restore model picker cache in ${configPath}.`);
+    }
+  };
+}
+
+async function getProviderModelOptions(provider, env) {
+  const helperUrl = pathToFileURL(path.join(workspaceRoot, "shared", "providerModels.js")).href;
+  const helper = await import(helperUrl);
+  return helper.providerAdditionalModelOptions(provider, env);
+}
+
+async function getProviderPromptSuggestions(provider, env) {
+  const helperUrl = pathToFileURL(path.join(workspaceRoot, "shared", "providerModels.js")).href;
+  const helper = await import(helperUrl);
+  return helper.providerPromptSuggestions(provider, env);
 }
 
 async function ensureCompatProxy(provider, env) {
@@ -518,6 +609,10 @@ function cleanupAndExit(code) {
     return;
   }
   exiting = true;
+  if (restoreModelPickerCache) {
+    restoreModelPickerCache();
+    restoreModelPickerCache = null;
+  }
   if (ownsProxyProcess && proxyProcess && !proxyProcess.killed) {
     proxyProcess.kill();
   }
